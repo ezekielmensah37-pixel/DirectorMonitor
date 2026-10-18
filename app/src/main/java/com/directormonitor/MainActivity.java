@@ -25,23 +25,30 @@ import org.videolan.libvlc.Media;
 import org.videolan.libvlc.MediaPlayer;
 import org.videolan.libvlc.util.VLCVideoLayout;
 
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.util.ArrayList;
+import java.util.Enumeration;
 
 public class MainActivity extends Activity {
 
-    private static final String DEFAULT_URL = "srt://:9000";
+    private static final String DEFAULT_PORT = "9000";
 
     private LibVLC libVlc;
     private MediaPlayer player;
     private VLCVideoLayout videoLayout;
     private Overlay overlay;
     private EditText urlField;
+    private TextView ipLabel;
     private LinearLayout topBar, bottomBar;
     private TextView status;
     private SharedPreferences prefs;
     private int dimLevel = 0;
     private final float[] dims = {1.0f, 0.5f, 0.2f};
     private boolean barsVisible = true;
+    private int form = 0;
+    private long ignoreStopUntil = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -69,19 +76,31 @@ public class MainActivity extends Activity {
         overlay.setOnClickListener(v -> toggleBars());
         root.addView(overlay, match);
 
-        // Top bar: URL + connect
+        // Top bar: tablet IP + port + Listen
         topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
+        topBar.setGravity(Gravity.CENTER_VERTICAL);
         topBar.setBackgroundColor(Color.argb(170, 0, 0, 0));
         topBar.setPadding(dp(8), dp(6), dp(8), dp(6));
+
+        ipLabel = new TextView(this);
+        ipLabel.setTextColor(Color.WHITE);
+        ipLabel.setTextSize(16f);
+        ipLabel.setPadding(0, 0, dp(12), 0);
+        topBar.addView(ipLabel, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         urlField = new EditText(this);
         urlField.setSingleLine(true);
+        urlField.setHint("Port");
+        urlField.setHintTextColor(Color.GRAY);
         urlField.setTextColor(Color.WHITE);
-        urlField.setText(prefs.getString("url", DEFAULT_URL));
+        urlField.setText(prefs.getString("in", DEFAULT_PORT));
         topBar.addView(urlField, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        Button connect = btn("Connect", v -> connect());
-        topBar.addView(connect);
+
+        Button listen = btn("Listen", v -> connect());
+        topBar.addView(listen);
         root.addView(topBar, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP));
@@ -107,15 +126,21 @@ public class MainActivity extends Activity {
             getWindow().setAttributes(lp);
             dimBtn.setText("Dim " + Math.round(dims[dimLevel] * 100) + "%");
         });
+        final Button formBtn = btn("Form 1", null);
+        formBtn.setOnClickListener(v -> {
+            form = (form + 1) % 3;
+            formBtn.setText("Form " + (form + 1));
+        });
         bottomBar.addView(frameBtn);
         bottomBar.addView(gridBtn);
         bottomBar.addView(safeBtn);
         bottomBar.addView(dimBtn);
+        bottomBar.addView(formBtn);
 
         status = new TextView(this);
         status.setTextColor(Color.WHITE);
         status.setPadding(dp(12), 0, 0, 0);
-        status.setText("Idle");
+        status.setText("Idle - tap Listen");
         bottomBar.addView(status, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
@@ -124,6 +149,7 @@ public class MainActivity extends Activity {
                 Gravity.BOTTOM));
 
         setContentView(root);
+        refreshIp();
 
         player.setEventListener(event -> runOnUiThread(() -> {
             switch (event.type) {
@@ -136,11 +162,12 @@ public class MainActivity extends Activity {
                     }
                     break;
                 case MediaPlayer.Event.EncounteredError:
-                    status.setText("Error - check URL / sender");
+                    status.setText("Error - try another Form button, then Listen");
                     break;
                 case MediaPlayer.Event.EndReached:
                 case MediaPlayer.Event.Stopped:
-                    status.setText("Stopped");
+                    if (System.currentTimeMillis() < ignoreStopUntil) break;
+                    status.setText("Stopped - tap Listen to retry");
                     break;
                 case MediaPlayer.Event.Vout:
                     Media.VideoTrack vt = player.getCurrentVideoTrack();
@@ -148,6 +175,7 @@ public class MainActivity extends Activity {
                         overlay.setVideoAspect((float) vt.width / (float) vt.height);
                         status.setText("Playing " + vt.width + "x" + vt.height);
                     }
+                    if (barsVisible) toggleBars();
                     break;
                 default:
                     break;
@@ -155,11 +183,56 @@ public class MainActivity extends Activity {
         }));
     }
 
-    private void connect() {
-        String url = urlField.getText().toString().trim();
-        if (url.isEmpty()) return;
-        prefs.edit().putString("url", url).apply();
+    private String getLocalIp() {
+        try {
+            Enumeration<NetworkInterface> ifs = NetworkInterface.getNetworkInterfaces();
+            while (ifs.hasMoreElements()) {
+                NetworkInterface ni = ifs.nextElement();
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                Enumeration<InetAddress> addrs = ni.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    InetAddress a = addrs.nextElement();
+                    if (a instanceof Inet4Address && !a.isLoopbackAddress()
+                            && a.isSiteLocalAddress()) {
+                        return a.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return "not on Wi-Fi";
+    }
 
+    private void refreshIp() {
+        ipLabel.setText("This tablet: " + getLocalIp());
+    }
+
+    private String buildUrl(String in) {
+        if (in.matches("\\d{2,5}")) {
+            switch (form) {
+                case 0:
+                    return "srt://:" + in;
+                case 1:
+                    return "srt://@:" + in;
+                default:
+                    return "srt://0.0.0.0:" + in + "?mode=listener";
+            }
+        }
+        return in; // a full URL typed by hand
+    }
+
+    private void connect() {
+        String in = urlField.getText().toString().trim();
+        if (in.isEmpty()) {
+            in = DEFAULT_PORT;
+            urlField.setText(in);
+        }
+        prefs.edit().putString("in", in).apply();
+        refreshIp();
+        String url = buildUrl(in);
+
+        ignoreStopUntil = System.currentTimeMillis() + 1500;
         player.stop();
         Media m = new Media(libVlc, Uri.parse(url));
         m.addOption(":network-caching=150");
@@ -167,12 +240,15 @@ public class MainActivity extends Activity {
         player.setMedia(m);
         m.release();
         player.play();
-        status.setText("Waiting for stream...");
+
+        if (in.matches("\\d{2,5}")) {
+            status.setText("Waiting - send to srt://" + getLocalIp() + ":" + in);
+        } else {
+            status.setText("Waiting for stream...");
+        }
 
         InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(urlField.getWindowToken(), 0);
-        barsVisible = true;
-        toggleBars(); // hide bars so the picture is clean
     }
 
     private void toggleBars() {
@@ -215,6 +291,7 @@ public class MainActivity extends Activity {
         super.onStart();
         player.attachViews(videoLayout, null, false, false);
         player.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT);
+        refreshIp();
     }
 
     @Override
@@ -291,7 +368,6 @@ public class MainActivity extends Activity {
             float w = getWidth();
             float h = getHeight();
 
-            // Where the video actually sits (letterboxed inside the screen)
             float vw = w;
             float vh = w / videoAspect;
             if (vh > h) {
@@ -301,7 +377,6 @@ public class MainActivity extends Activity {
             RectF v = new RectF((w - vw) / 2f, (h - vh) / 2f, (w + vw) / 2f, (h + vh) / 2f);
             RectF f = v;
 
-            // Frame guide: dim everything outside the chosen aspect
             float r = FRAME_RATIOS[frame];
             if (r > 0f) {
                 float fw = v.width();
@@ -319,7 +394,6 @@ public class MainActivity extends Activity {
                 c.drawRect(f, line);
             }
 
-            // Grids
             if ((grid & 1) != 0) {
                 float x1 = f.left + f.width() / 3f;
                 float x2 = f.left + 2f * f.width() / 3f;
@@ -338,7 +412,6 @@ public class MainActivity extends Activity {
                 c.drawLine(cx, cy - s, cx, cy + s, line);
             }
 
-            // Safe areas: action 93%, title 90%
             if (safe) {
                 float[] pct = {0.93f, 0.90f};
                 for (float p : pct) {
